@@ -120,13 +120,11 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection, urls=
                     pass  # Keep original if parse fails
             
             # Build caption: Title + Description + Date (NO links!)
-            caption = f"<b>{entry.title}</b>\n\n"
+            caption = f"{entry.title}\n\n"
             remaining = CAPTION_MAX_LENGTH - len(caption) - len(pub_date) - 10
             if len(clean_desc) > remaining:
                 clean_desc = clean_desc[:remaining-3] + "..."
             caption += f"{clean_desc}"
-            if pub_date:
-                caption += f"\n\n<i>{pub_date}</i>"
             
             logger.debug(f"{entry_log} 📝 Caption ready ({len(caption)}/{CAPTION_MAX_LENGTH} chars)")
             
@@ -145,8 +143,7 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection, urls=
                     await app.send_video(
                         chat_id=news_channel,
                         video=media_url,
-                        caption=caption,
-                        parse_mode="ParseMode.HTMLl"
+                        caption=caption
                         # ❌ REMOVED: timeout=60 (not supported)
                     )
                     logger.info(f"{entry_log} ✅ Sent VIDEO")
@@ -154,8 +151,7 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection, urls=
                     await app.send_photo(
                         chat_id=news_channel,
                         photo=media_url,
-                        caption=caption,
-                        parse_mode="ParseMode.HTML"
+                        caption=caption
                         # ❌ REMOVED: timeout=30 (not supported)
                     )
                     logger.info(f"{entry_log} ✅ Sent PHOTO")
@@ -163,8 +159,7 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection, urls=
                 # Fallback: text-only message
                 await app.send_message(
                     chat_id=news_channel,
-                    text=caption,
-                    parse_mode="ParseMode.HTML"
+                    text=caption
                 )
                 logger.info(f"{entry_log} ✅ Sent TEXT (no media available)")
                 
