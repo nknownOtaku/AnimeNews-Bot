@@ -1,73 +1,256 @@
 import asyncio
-import feedparser
 import logging
+import feedparser
+import re
+from datetime import datetime
 from pyrogram import Client
+from pyrogram.errors import RPCError
 
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
+logger = logging.getLogger(__name__)
 
-async def fetch_and_send_news(app: Client, db, global_settings_collection, urls):
-    logging.info("Checking global configuration...")
+# Constants
+MAL_RSS_URL = "https://myanimelist.net/rss/news.xml"
+CHECK_INTERVAL = 1800  # 30 minutes in seconds
+CAPTION_MAX_LENGTH = 1024  # Telegram limit
 
-    config = global_settings_collection.find_one({"_id": "config"})
-    if not config or "news_channel" not in config:
-        logging.warning("News channel not configured. Skipping fetch.")
+
+async def fetch_and_send_news(app: Client, db, global_settings_collection):
+    """Fetch MAL RSS and send news with media + caption"""
+    
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    logger.info(f"[{timestamp}] 🔄 Starting MAL news fetch cycle")
+    
+    # Load config
+    try:
+        config = global_settings_collection.find_one({"_id": "config"})
+        if not config or "news_channel" not in config:
+            logger.warning(f"[{timestamp}] ⚠️ News channel not configured - skipping")
+            return
+        news_channel = config["news_channel"]  # Can be @username or -100xxx
+        logger.info(f"[{timestamp}] 📬 Target: {news_channel}")
+    except Exception as e:
+        logger.error(f"[{timestamp}] ❌ Config error: {e}", exc_info=True)
         return
 
-    news_channel = "@" + config["news_channel"]
+    stats = {"sent": 0, "skipped": 0, "errors": 0}
+    
+    # Fetch and parse RSS
+    try:
+        logger.info(f"[{timestamp}] 📡 Fetching: {MAL_RSS_URL}")
+        feed = await asyncio.to_thread(feedparser.parse, MAL_RSS_URL)
+        entries = list(feed.entries)[:10]  # First 10 items only
+        entries.reverse()  # Oldest → newest for chronological sending
+        logger.info(f"[{timestamp}] ✅ Parsed {len(entries)} entries")
+    except Exception as e:
+        logger.error(f"[{timestamp}] ❌ RSS fetch error: {e}", exc_info=True)
+        return
 
-    for url in urls:
-        logging.info(f"Fetching RSS feed: {url}")
-
-        feed = await asyncio.to_thread(feedparser.parse, url)
-        entries = list(feed.entries)[::-1]
-
-        logging.info(f"Total entries fetched: {len(entries)}")
-
-        for entry in entries:
-            entry_id = entry.get('id', entry.get('link'))
-
-            logging.info(f"Processing entry: {entry.title}")
-
-            if not db.sent_news.find_one({"entry_id": entry_id}):
-                logging.info(f"New entry detected: {entry.title}")
-
-                thumbnail_url = entry.media_thumbnail[0]['url'] if 'media_thumbnail' in entry else None
-                msg = f"<b>**{entry.title}**</b>\n\n{entry.summary if 'summary' in entry else ''}\n\n<a href='{entry.link}'>Read more</a>"
-
+    for idx, entry in enumerate(entries, 1):
+        entry_log = f"[{timestamp}] 📰 [{idx}/{len(entries)}]"
+        entry_id = entry.get('id', entry.get('link', 'unknown'))
+        title = entry.get('title', 'Untitled')[:80]
+        
+        logger.info(f"{entry_log} Processing: {title}...")
+        
+        # Duplicate check
+        try:
+            if db.sent_news.find_one({"entry_id": entry_id}):
+                logger.debug(f"{entry_log} ⏭️ Already sent - skipping")
+                stats["skipped"] += 1
+                continue
+            logger.info(f"{entry_log} ✓ New entry")
+        except Exception as e:
+            logger.error(f"{entry_log} ❌ DB check error: {e}", exc_info=True)
+            stats["errors"] += 1
+            continue
+        
+        # Extract media (image or video)
+        media_url = None
+        media_type = None
+        
+        try:
+            # Check for media:thumbnail (images)
+            if hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
+                media_url = entry.media_thumbnail[0].get('url', '').strip()
+                media_type = 'photo'
+                logger.debug(f"{entry_log} 🖼️ Image: {media_url[:70]}...")
+            
+            # Check for media:content (could be video)
+            elif hasattr(entry, 'media_content') and entry.media_content:
+                for media in entry.media_content:
+                    if media.get('medium') == 'video' or media.get('type', '').startswith('video/'):
+                        media_url = media.get('url', '').strip()
+                        media_type = 'video'
+                        logger.debug(f"{entry_log} 🎬 Video: {media_url[:70]}...")
+                        break
+                # Fallback to thumbnail if no video found
+                if not media_url and hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
+                    media_url = entry.media_thumbnail[0].get('url', '').strip()
+                    media_type = 'photo'
+        except Exception as e:
+            logger.warning(f"{entry_log} ⚠️ Media extract warning: {e}")
+        
+        # Prepare caption (NO links, per requirements)
+        try:
+            # Clean description: remove HTML tags & entities
+            raw_desc = entry.get('summary', entry.get('description', ''))
+            clean_desc = re.sub(r'<[^>]+>', '', raw_desc)  # Remove HTML tags
+            clean_desc = clean_desc.replace('&#039;', "'").replace('&quot;', '"')
+            clean_desc = clean_desc.replace('&amp;', '&').replace('&mdash;', '—')
+            clean_desc = ' '.join(clean_desc.split())  # Normalize whitespace
+            
+            # Get publication date
+            pub_date = entry.get('published', '')
+            if pub_date:
+                # Try to format nicely
                 try:
-                    logging.info("Waiting 15 seconds before sending message...")
-                    await asyncio.sleep(15)
-
-                    if thumbnail_url:
-                        logging.info("Sending news with thumbnail...")
-                        await app.send_photo(chat_id=news_channel, photo=thumbnail_url, caption=msg)
-                    else:
-                        logging.info("Sending news without thumbnail...")
-                        await app.send_message(chat_id=news_channel, text=msg)
-
-                    db.sent_news.insert_one({
-                        "entry_id": entry_id,
-                        "title": entry.title,
-                        "link": entry.link
-                    })
-
-                    logging.info(f"Successfully sent news: {entry.title}")
-
-                except Exception as e:
-                    logging.error(f"Error sending news message: {e}")
-
+                    parsed_date = datetime.strptime(pub_date, "%a, %d %b %Y %H:%M:%S %z")
+                    pub_date = parsed_date.strftime("%b %d, %Y at %I:%M %p")
+                except:
+                    pass  # Keep original if parse fails
+            
+            # Build caption: Title + Description + Date (no links!)
+            caption = f"<b>{entry.title}</b>\n\n"
+            remaining = CAPTION_MAX_LENGTH - len(caption) - len(pub_date) - 10
+            if len(clean_desc) > remaining:
+                clean_desc = clean_desc[:remaining-3] + "..."
+            caption += f"{clean_desc}"
+            if pub_date:
+                caption += f"\n\n<i>{pub_date}</i>"
+            
+            logger.debug(f"{entry_log} 📝 Caption ready ({len(caption)}/{CAPTION_MAX_LENGTH} chars)")
+            
+        except Exception as e:
+            logger.error(f"{entry_log} ❌ Caption prep error: {e}", exc_info=True)
+            stats["errors"] += 1
+            continue
+        
+        # Send to Telegram with media
+        try:
+            logger.info(f"{entry_log} 🚀 Sending with {media_type or 'text'}...")
+            await asyncio.sleep(2)  # Small delay to avoid rate limits
+            
+            if media_url and media_url.startswith('http'):
+                if media_type == 'video':
+                    await app.send_video(
+                        chat_id=news_channel,
+                        video=media_url,
+                        caption=caption,
+                        parse_mode="html",
+                        timeout=60
+                    )
+                    logger.info(f"{entry_log} ✅ Sent VIDEO")
+                else:  # photo or fallback
+                    await app.send_photo(
+                        chat_id=news_channel,
+                        photo=media_url,
+                        caption=caption,
+                        parse_mode="html",
+                        timeout=30
+                    )
+                    logger.info(f"{entry_log} ✅ Sent PHOTO")
             else:
-                logging.info(f"Skipping already sent entry: {entry.title}")
+                # Fallback: text-only message
+                await app.send_message(
+                    chat_id=news_channel,
+                    text=caption,
+                    parse_mode="html"
+                )
+                logger.info(f"{entry_log} ✅ Sent TEXT (no media)")
+                
+        except RPCError as e:
+            logger.error(f"{entry_log} ❌ Telegram RPC error: {e}", exc_info=True)
+            stats["errors"] += 1
+            continue
+        except Exception as e:
+            logger.error(f"{entry_log} ❌ Send error: {e}", exc_info=True)
+            stats["errors"] += 1
+            continue
+        
+        # Save to DB
+        try:
+            db.sent_news.insert_one({
+                "entry_id": entry_id,
+                "title": entry.title,
+                "media_type": media_type,
+                "sent_at": datetime.utcnow()
+            })
+            logger.info(f"{entry_log} 💾 Saved to DB")
+            stats["sent"] += 1
+        except Exception as e:
+            logger.error(f"{entry_log} ⚠️ DB save warning: {e} (message was sent)")
+            stats["sent"] += 1  # Count as sent even if DB fails
+    
+    # Cycle summary
+    logger.info(
+        f"[{timestamp}] 🏁 Cycle complete: "
+        f"✅ {stats['sent']} sent | "
+        f"⏭️ {stats['skipped']} skipped | "
+        f"❌ {stats['errors']} errors"
+    )
 
-async def news_feed_loop(app: Client, db, global_settings_collection, urls):
-    logging.info("Starting RSS news feed loop...")
 
+async def news_feed_loop(app: Client, db, global_settings_collection):
+    """Main loop: check MAL RSS every 30 minutes"""
+    
+    logger.info("🚀 MAL News Bot STARTED")
+    logger.info(f"⏱ Check interval: {CHECK_INTERVAL//60} minutes")
+    logger.info(f"📡 Feed: {MAL_RSS_URL}")
+    logger.info(f"🗄 DB collection: sent_news (duplicate prevention)")
+    
+    cycle_count = 0
+    
     while True:
-        logging.info("Running news fetch cycle...")
-        await fetch_and_send_news(app, db, global_settings_collection, urls)
+        cycle_count += 1
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        
+        try:
+            logger.info(f"\n[{timestamp}] 🔄 Cycle #{cycle_count} beginning...")
+            cycle_start = datetime.utcnow()
+            
+            await fetch_and_send_news(app, db, global_settings_collection)
+            
+            cycle_duration = (datetime.utcnow() - cycle_start).total_seconds()
+            next_check = datetime.utcnow().timestamp() + CHECK_INTERVAL
+            next_check_str = datetime.fromtimestamp(next_check).strftime("%H:%M:%S")
+            
+            logger.info(
+                f"[{timestamp}] ⏱ Cycle #{cycle_count} done in {cycle_duration:.1f}s | "
+                f"Next check at ~{next_check_str}\n"
+            )
+            
+        except KeyboardInterrupt:
+            logger.warning("⚠️ Interrupted by user - shutting down")
+            break
+        except Exception as e:
+            logger.error(f"❌ Critical loop error: {e}", exc_info=True)
+            logger.info("🔁 Retrying in 60 seconds...")
+            await asyncio.sleep(60)
+            continue
+        
+        await asyncio.sleep(CHECK_INTERVAL)
 
-        logging.info("Sleeping for 10 seconds before next check...")
-        await asyncio.sleep(10)
+
+# Optional helper: Setup MongoDB logging for persistent error tracking
+def setup_mongo_logging(db, level=logging.WARNING):
+    """Add MongoDB handler for persistent log storage"""
+    class MongoHandler(logging.Handler):
+        def emit(self, record):
+            if record.levelno >= level:
+                try:
+                    db.logs.insert_one({
+                        "timestamp": datetime.utcnow(),
+                        "level": record.levelname,
+                        "message": record.getMessage(),
+                        "module": record.module,
+                        "function": record.funcName,
+                        "line": record.lineno
+                    })
+                except:
+                    pass  # Never crash the bot for logging failures
+    return MongoHandler()
