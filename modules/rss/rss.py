@@ -146,8 +146,8 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection, urls=
                         chat_id=news_channel,
                         video=media_url,
                         caption=caption,
-                        parse_mode="html",
-                        timeout=60
+                        parse_mode="html"
+                        # ❌ REMOVED: timeout=60 (not supported)
                     )
                     logger.info(f"{entry_log} ✅ Sent VIDEO")
                 else:  # photo or fallback
@@ -155,8 +155,8 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection, urls=
                         chat_id=news_channel,
                         photo=media_url,
                         caption=caption,
-                        parse_mode="html",
-                        timeout=30
+                        parse_mode="html"
+                        # ❌ REMOVED: timeout=30 (not supported)
                     )
                     logger.info(f"{entry_log} ✅ Sent PHOTO")
             else:
