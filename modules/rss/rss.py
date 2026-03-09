@@ -146,7 +146,7 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection, urls=
                         chat_id=news_channel,
                         video=media_url,
                         caption=caption,
-                        parse_mode="html"
+                        parse_mode="ParseMode.HTMLl"
                         # ❌ REMOVED: timeout=60 (not supported)
                     )
                     logger.info(f"{entry_log} ✅ Sent VIDEO")
@@ -155,7 +155,7 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection, urls=
                         chat_id=news_channel,
                         photo=media_url,
                         caption=caption,
-                        parse_mode="html"
+                        parse_mode="ParseMode.HTML"
                         # ❌ REMOVED: timeout=30 (not supported)
                     )
                     logger.info(f"{entry_log} ✅ Sent PHOTO")
@@ -164,7 +164,7 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection, urls=
                 await app.send_message(
                     chat_id=news_channel,
                     text=caption,
-                    parse_mode="html"
+                    parse_mode="ParseMode.HTML"
                 )
                 logger.info(f"{entry_log} ✅ Sent TEXT (no media available)")
                 
