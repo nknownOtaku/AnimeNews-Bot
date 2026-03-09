@@ -13,17 +13,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Constants
+# 🔒 Hardcoded constants - IGNORES passed urls parameter
 MAL_RSS_URL = "https://myanimelist.net/rss/news.xml"
 CHECK_INTERVAL = 1800  # 30 minutes in seconds
-CAPTION_MAX_LENGTH = 1024  # Telegram limit
+CAPTION_MAX_LENGTH = 1024  # Telegram caption limit
 
 
-async def fetch_and_send_news(app: Client, db, global_settings_collection):
-    """Fetch MAL RSS and send news with media + caption"""
+async def fetch_and_send_news(app: Client, db, global_settings_collection, urls=None):
+    """
+    Fetch MAL RSS and send news with media + caption.
+    
+    Note: 'urls' parameter is accepted for compatibility but IGNORED.
+    This function only uses the hardcoded MyAnimeList RSS feed.
+    """
     
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     logger.info(f"[{timestamp}] 🔄 Starting MAL news fetch cycle")
+    logger.info(f"[{timestamp}] ℹ️  URLs parameter ignored - using hardcoded MAL feed only")
     
     # Load config
     try:
@@ -31,21 +37,21 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection):
         if not config or "news_channel" not in config:
             logger.warning(f"[{timestamp}] ⚠️ News channel not configured - skipping")
             return
-        news_channel = config["news_channel"]  # Can be @username or -100xxx
-        logger.info(f"[{timestamp}] 📬 Target: {news_channel}")
+        news_channel = config["news_channel"]
+        logger.info(f"[{timestamp}] 📬 Target channel: {news_channel}")
     except Exception as e:
         logger.error(f"[{timestamp}] ❌ Config error: {e}", exc_info=True)
         return
 
     stats = {"sent": 0, "skipped": 0, "errors": 0}
     
-    # Fetch and parse RSS
+    # Fetch MAL RSS ONLY (ignores any passed URLs)
     try:
         logger.info(f"[{timestamp}] 📡 Fetching: {MAL_RSS_URL}")
         feed = await asyncio.to_thread(feedparser.parse, MAL_RSS_URL)
         entries = list(feed.entries)[:10]  # First 10 items only
         entries.reverse()  # Oldest → newest for chronological sending
-        logger.info(f"[{timestamp}] ✅ Parsed {len(entries)} entries")
+        logger.info(f"[{timestamp}] ✅ Parsed {len(entries)} entries from MAL")
     except Exception as e:
         logger.error(f"[{timestamp}] ❌ RSS fetch error: {e}", exc_info=True)
         return
@@ -57,19 +63,19 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection):
         
         logger.info(f"{entry_log} Processing: {title}...")
         
-        # Duplicate check
+        # ── Duplicate check ──
         try:
             if db.sent_news.find_one({"entry_id": entry_id}):
                 logger.debug(f"{entry_log} ⏭️ Already sent - skipping")
                 stats["skipped"] += 1
                 continue
-            logger.info(f"{entry_log} ✓ New entry")
+            logger.info(f"{entry_log} ✓ New entry detected")
         except Exception as e:
             logger.error(f"{entry_log} ❌ DB check error: {e}", exc_info=True)
             stats["errors"] += 1
             continue
         
-        # Extract media (image or video)
+        # ── Extract media (image or video) ──
         media_url = None
         media_type = None
         
@@ -78,7 +84,7 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection):
             if hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
                 media_url = entry.media_thumbnail[0].get('url', '').strip()
                 media_type = 'photo'
-                logger.debug(f"{entry_log} 🖼️ Image: {media_url[:70]}...")
+                logger.debug(f"{entry_log} 🖼️ Image found: {media_url[:70]}...")
             
             # Check for media:content (could be video)
             elif hasattr(entry, 'media_content') and entry.media_content:
@@ -86,16 +92,16 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection):
                     if media.get('medium') == 'video' or media.get('type', '').startswith('video/'):
                         media_url = media.get('url', '').strip()
                         media_type = 'video'
-                        logger.debug(f"{entry_log} 🎬 Video: {media_url[:70]}...")
+                        logger.debug(f"{entry_log} 🎬 Video found: {media_url[:70]}...")
                         break
                 # Fallback to thumbnail if no video found
                 if not media_url and hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
                     media_url = entry.media_thumbnail[0].get('url', '').strip()
                     media_type = 'photo'
         except Exception as e:
-            logger.warning(f"{entry_log} ⚠️ Media extract warning: {e}")
+            logger.warning(f"{entry_log} ⚠️ Media extraction warning: {e}")
         
-        # Prepare caption (NO links, per requirements)
+        # ── Prepare caption (NO LINKS per requirements) ──
         try:
             # Clean description: remove HTML tags & entities
             raw_desc = entry.get('summary', entry.get('description', ''))
@@ -104,17 +110,16 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection):
             clean_desc = clean_desc.replace('&amp;', '&').replace('&mdash;', '—')
             clean_desc = ' '.join(clean_desc.split())  # Normalize whitespace
             
-            # Get publication date
+            # Format publication date
             pub_date = entry.get('published', '')
             if pub_date:
-                # Try to format nicely
                 try:
                     parsed_date = datetime.strptime(pub_date, "%a, %d %b %Y %H:%M:%S %z")
                     pub_date = parsed_date.strftime("%b %d, %Y at %I:%M %p")
                 except:
                     pass  # Keep original if parse fails
             
-            # Build caption: Title + Description + Date (no links!)
+            # Build caption: Title + Description + Date (NO links!)
             caption = f"<b>{entry.title}</b>\n\n"
             remaining = CAPTION_MAX_LENGTH - len(caption) - len(pub_date) - 10
             if len(clean_desc) > remaining:
@@ -130,7 +135,7 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection):
             stats["errors"] += 1
             continue
         
-        # Send to Telegram with media
+        # ── Send to Telegram with media ──
         try:
             logger.info(f"{entry_log} 🚀 Sending with {media_type or 'text'}...")
             await asyncio.sleep(2)  # Small delay to avoid rate limits
@@ -161,7 +166,7 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection):
                     text=caption,
                     parse_mode="html"
                 )
-                logger.info(f"{entry_log} ✅ Sent TEXT (no media)")
+                logger.info(f"{entry_log} ✅ Sent TEXT (no media available)")
                 
         except RPCError as e:
             logger.error(f"{entry_log} ❌ Telegram RPC error: {e}", exc_info=True)
@@ -172,7 +177,7 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection):
             stats["errors"] += 1
             continue
         
-        # Save to DB
+        # ── Save to DB (duplicate prevention) ──
         try:
             db.sent_news.insert_one({
                 "entry_id": entry_id,
@@ -183,10 +188,10 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection):
             logger.info(f"{entry_log} 💾 Saved to DB")
             stats["sent"] += 1
         except Exception as e:
-            logger.error(f"{entry_log} ⚠️ DB save warning: {e} (message was sent)")
+            logger.error(f"{entry_log} ⚠️ DB save warning: {e} (message was sent anyway)")
             stats["sent"] += 1  # Count as sent even if DB fails
     
-    # Cycle summary
+    # ── Cycle summary ──
     logger.info(
         f"[{timestamp}] 🏁 Cycle complete: "
         f"✅ {stats['sent']} sent | "
@@ -195,13 +200,17 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection):
     )
 
 
-async def news_feed_loop(app: Client, db, global_settings_collection):
-    """Main loop: check MAL RSS every 30 minutes"""
+async def news_feed_loop(app: Client, db, global_settings_collection, urls=None):
+    """
+    Main loop: MAL RSS only, checks every 30 minutes.
+    
+    Note: 'urls' parameter is accepted for compatibility but IGNORED.
+    """
     
     logger.info("🚀 MAL News Bot STARTED")
     logger.info(f"⏱ Check interval: {CHECK_INTERVAL//60} minutes")
-    logger.info(f"📡 Feed: {MAL_RSS_URL}")
-    logger.info(f"🗄 DB collection: sent_news (duplicate prevention)")
+    logger.info(f"📡 Feed: {MAL_RSS_URL} (hardcoded - urls param ignored)")
+    logger.info(f"🗄 DB: sent_news collection (duplicate prevention)")
     
     cycle_count = 0
     
@@ -213,7 +222,8 @@ async def news_feed_loop(app: Client, db, global_settings_collection):
             logger.info(f"\n[{timestamp}] 🔄 Cycle #{cycle_count} beginning...")
             cycle_start = datetime.utcnow()
             
-            await fetch_and_send_news(app, db, global_settings_collection)
+            # Call with 4 args for compatibility (4th arg ignored internally)
+            await fetch_and_send_news(app, db, global_settings_collection, urls)
             
             cycle_duration = (datetime.utcnow() - cycle_start).total_seconds()
             next_check = datetime.utcnow().timestamp() + CHECK_INTERVAL
@@ -234,23 +244,3 @@ async def news_feed_loop(app: Client, db, global_settings_collection):
             continue
         
         await asyncio.sleep(CHECK_INTERVAL)
-
-
-# Optional helper: Setup MongoDB logging for persistent error tracking
-def setup_mongo_logging(db, level=logging.WARNING):
-    """Add MongoDB handler for persistent log storage"""
-    class MongoHandler(logging.Handler):
-        def emit(self, record):
-            if record.levelno >= level:
-                try:
-                    db.logs.insert_one({
-                        "timestamp": datetime.utcnow(),
-                        "level": record.levelname,
-                        "message": record.getMessage(),
-                        "module": record.module,
-                        "function": record.funcName,
-                        "line": record.lineno
-                    })
-                except:
-                    pass  # Never crash the bot for logging failures
-    return MongoHandler()
