@@ -16,9 +16,7 @@ async def fetch_and_send_news(app: Client, db, global_settings_collection, urls)
         logging.warning("News channel not configured. Skipping fetch.")
         return
 
-    news_channel = config["news_channel"]
-    if not str(news_channel).startswith("-100"):
-        news_channel = "@" + news_channel
+    news_channel = "@" + config["news_channel"]
 
     for url in urls:
         logging.info(f"Fetching RSS feed: {url}")
